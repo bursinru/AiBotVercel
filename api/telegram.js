@@ -30,7 +30,8 @@ function getSession(chatId) {
   if (!sessions.has(chatId)) {
     sessions.set(chatId, {
       history: [],
-      model: DEFAULT_MODEL
+      model: DEFAULT_MODEL,
+      egorMoscowGreeted: false
     });
   }
   return sessions.get(chatId);
@@ -299,6 +300,13 @@ module.exports = async (req, res) => {
   const session = getSession(chatId);
   const text = message.text;
   const photos = message.photo;
+
+   // Персональное приветствие для пользователя с ID 69878827
+  if (Number(fromUserId) === 69878827 && !session.egorMoscowGreeted) {
+    session.egorMoscowGreeted = true;
+    await sendTelegramMessage(token, chatId, "Я знаю, что ты Егор Кузнецов из Москвы.");
+    return res.status(200).json({ ok: true });
+  }
 
   // Команды
   if (typeof text === "string" && text.startsWith("/")) {
