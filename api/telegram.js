@@ -6,6 +6,16 @@ const TELEGRAM_API = "https://api.telegram.org";
 // Ключ: chatId, значение: { history: [{ role, content }], model: string }
 const sessions = new Map();
 
+const ADMIN_TELEGRAM_ID = 114868027;
+
+// Глобальные настройки (живут пока «теплый» инстанс функции).
+// Менять может только админ.
+const globalSettings = {
+  // Дополнительные правила/стиль общения, применяются ко ВСЕМ пользователям.
+  // Например: "Пиши как двачер" (но админ должен понимать риски/уместность).
+  style: ""
+};
+
 const DEFAULT_MODEL = "gpt-4.1-mini";
 const SUPPORTED_MODELS = {
   "gpt-4.1-mini": "Быстрый и дешевый, подходит для большинства задач.",
@@ -29,7 +39,11 @@ function resetSession(chatId) {
 }
 
 function buildSystemPrompt() {
-  return "Ты дружелюбный помощник, который кратко и по делу отвечает на русском языке, может объяснять шаг за шагом и учитывать контекст прошлых сообщений.";
+  const base =
+    "Ты дружелюбный помощник, который кратко и по делу отвечает на русском языке, может объяснять шаг за шагом и учитывать контекст прошлых сообщений.";
+  const style = typeof globalSettings.style === "string" ? globalSettings.style.trim() : "";
+  if (!style) return base;
+  return `${base}\n\nДополнительный стиль общения (глобально): ${style}`;
 }
 
 async function callAi({ chatId, userContentParts }) {
@@ -127,6 +141,10 @@ async function getFileUrl(token, fileId) {
   return `${TELEGRAM_API}/file/bot${token}/${filePath}`;
 }
 
+function isAdminUser(userId) {
+  return Number(userId) === Number(process.env.TELEGRAM_ADMIN_ID || ADMIN_TELEGRAM_ID);
+}
+
 function parseModelCommand(text) {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/model")) return null;
@@ -162,6 +180,95 @@ function normalizeModelName(input) {
   return null;
 }
 
+function parseStyleCommand(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/style")) return null;
+
+  const rest = trimmed.replace(/^\/style\s*/i, "");
+  if (!rest) return { action: "show" };
+
+  if (rest.toLowerCase() === "reset") return { action: "reset" };
+  if (rest.toLowerCase() === "off") return { action: "reset" };
+
+  return { action: "set", value: rest };
+}
+
+function parseFetchCommand(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/fetch")) return null;
+  const rest = trimmed.replace(/^\/fetch\s*/i, "").trim();
+  if (!rest) return { action: "help" };
+  return { action: "fetch", url: rest };
+}
+
+function parseCodeCommand(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/code")) return null;
+  const rest = trimmed.replace(/^\/code\s*/i, "").trim();
+  if (!rest) return { action: "help" };
+  return { action: "gen", instruction: rest };
+}
+
+function looksLikePrivateHost(hostname) {
+  const h = hostname.toLowerCase();
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local")) return true;
+  if (h === "127.0.0.1" || h === "::1") return true;
+  if (h.startsWith("127.")) return true;
+  if (h.startsWith("10.")) return true;
+  if (h.startsWith("192.168.")) return true;
+  if (h.startsWith("169.254.")) return true;
+  // 172.16.0.0 — 172.31.255.255
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return true;
+  return false;
+}
+
+async function fetchTextFromUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, error: "Некорректный URL." };
+  }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return { ok: false, error: "Разрешены только http/https ссылки." };
+  }
+  if (looksLikePrivateHost(parsed.hostname)) {
+    return { ok: false, error: "Этот хост недоступен (защита от SSRF)." };
+  }
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch(parsed.toString(), {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "ai-telegram-bot-vercel/1.0"
+      }
+    });
+
+    if (!res.ok) {
+      return { ok: false, error: `Не удалось скачать страницу (HTTP ${res.status}).` };
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("text") && !contentType.includes("json") && !contentType.includes("xml") && !contentType.includes("html")) {
+      return { ok: false, error: `Неподдерживаемый тип контента: ${contentType || "unknown"}` };
+    }
+
+    const text = await res.text();
+    const clipped = text.slice(0, 30_000); // ограничим размер
+    return { ok: true, text: clipped };
+  } catch (e) {
+    return { ok: false, error: "Ошибка при скачивании страницы (timeout/сеть)." };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
     return res.status(200).json({ ok: true, message: "Telegram bot is running." });
@@ -176,21 +283,153 @@ module.exports = async (req, res) => {
   const update = req.body;
 
   const message = update?.message;
+  const fromUserId = message?.from?.id;
   const chatId = message?.chat?.id;
 
   if (!chatId || !message) {
     return res.status(200).json({ ok: true });
   }
 
+  const isAdmin = isAdminUser(fromUserId);
   const session = getSession(chatId);
   const text = message.text;
   const photos = message.photo;
 
   // Команды
   if (typeof text === "string" && text.startsWith("/")) {
+    if (text.startsWith("/help")) {
+      const baseHelp =
+        "Команды:\n" +
+        "• /reset — очистить память диалога (только для этого чата)\n" +
+        "• /model — показать текущую модель\n" +
+        "• /model list — список моделей\n" +
+        "• /model <name> — выбрать модель\n";
+      const adminHelp =
+        "\nАдмин:\n" +
+        "• /admin — админ-меню\n" +
+        "• /style — показать глобальный стиль\n" +
+        "• /style <текст> — задать глобальный стиль для всех\n" +
+        "• /style reset — сбросить глобальный стиль\n" +
+        "• /fetch <url> — скачать страницу и кратко пересказать\n" +
+        "• /code <задача> — сгенерировать патч/инструкции по коду (без авто-применения)\n";
+
+      await sendTelegramMessage(token, chatId, isAdmin ? baseHelp + adminHelp : baseHelp);
+      return res.status(200).json({ ok: true });
+    }
+
     if (text.startsWith("/reset")) {
       resetSession(chatId);
       await sendTelegramMessage(token, chatId, "Память диалога очищена. Начнём заново 🙂");
+      return res.status(200).json({ ok: true });
+    }
+
+    if (text.startsWith("/admin")) {
+      if (!isAdmin) {
+        await sendTelegramMessage(token, chatId, "Команда доступна только админу.");
+        return res.status(200).json({ ok: true });
+      }
+      const style = globalSettings.style ? `\nТекущий стиль: ${globalSettings.style}` : "\nСтиль: (не задан)";
+      await sendTelegramMessage(
+        token,
+        chatId,
+        "Админка:\n" +
+          "• /style — посмотреть стиль\n" +
+          "• /style <текст> — задать стиль\n" +
+          "• /style reset — сбросить стиль\n" +
+          "• /fetch <url> — пересказать страницу\n" +
+          "• /code <задача> — сгенерировать патч/инструкции\n" +
+          style
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    const styleCmd = parseStyleCommand(text);
+    if (styleCmd) {
+      if (!isAdmin) {
+        await sendTelegramMessage(token, chatId, "Команда доступна только админу.");
+        return res.status(200).json({ ok: true });
+      }
+
+      if (styleCmd.action === "show") {
+        await sendTelegramMessage(
+          token,
+          chatId,
+          globalSettings.style ? `Глобальный стиль: ${globalSettings.style}` : "Глобальный стиль не задан."
+        );
+        return res.status(200).json({ ok: true });
+      }
+
+      if (styleCmd.action === "reset") {
+        globalSettings.style = "";
+        await sendTelegramMessage(token, chatId, "Глобальный стиль сброшен.");
+        return res.status(200).json({ ok: true });
+      }
+
+      if (styleCmd.action === "set") {
+        globalSettings.style = String(styleCmd.value).slice(0, 600);
+        await sendTelegramMessage(token, chatId, "Глобальный стиль сохранён и применяется ко всем пользователям.");
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    const fetchCmd = parseFetchCommand(text);
+    if (fetchCmd) {
+      if (!isAdmin) {
+        await sendTelegramMessage(token, chatId, "Команда доступна только админу.");
+        return res.status(200).json({ ok: true });
+      }
+      if (fetchCmd.action === "help") {
+        await sendTelegramMessage(token, chatId, "Использование: /fetch https://example.com");
+        return res.status(200).json({ ok: true });
+      }
+
+      const r = await fetchTextFromUrl(fetchCmd.url);
+      if (!r.ok) {
+        await sendTelegramMessage(token, chatId, `Не получилось: ${r.error}`);
+        return res.status(200).json({ ok: true });
+      }
+
+      const userContentParts = [
+        {
+          type: "text",
+          text:
+            "Кратко перескажи содержимое страницы и выпиши ключевые пункты списком. Если это статья — добавь TL;DR.\n\n" +
+            `URL: ${fetchCmd.url}\n\n` +
+            `Текст страницы (обрезан):\n${r.text}`
+        }
+      ];
+      const replyText = await callAi({ chatId, userContentParts });
+      await sendTelegramMessage(token, chatId, replyText);
+      return res.status(200).json({ ok: true });
+    }
+
+    const codeCmd = parseCodeCommand(text);
+    if (codeCmd) {
+      if (!isAdmin) {
+        await sendTelegramMessage(token, chatId, "Команда доступна только админу.");
+        return res.status(200).json({ ok: true });
+      }
+      if (codeCmd.action === "help") {
+        await sendTelegramMessage(token, chatId, "Использование: /code <что нужно изменить/добавить в коде>");
+        return res.status(200).json({ ok: true });
+      }
+
+      const userContentParts = [
+        {
+          type: "text",
+          text:
+            "Ты помогаешь вносить изменения в проект Telegram-бота на Vercel. " +
+            "Сгенерируй план и патч в формате unified diff (без применения). " +
+            "Если не хватает контекста — перечисли, какие файлы/фрагменты нужны.\n\n" +
+            `Задача: ${codeCmd.instruction}`
+        }
+      ];
+      const replyText = await callAi({ chatId, userContentParts });
+      await sendTelegramMessage(
+        token,
+        chatId,
+        replyText.length > 3500 ? replyText.slice(0, 3500) + "\n\n(обрезано)" : replyText
+      );
       return res.status(200).json({ ok: true });
     }
 
