@@ -1,0 +1,21 @@
+{
+  "name": "ai-telegram-bot-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Простой AI-бот для Telegram, задеплоенный на Vercel",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "node api/telegram.js",
+    "deploy": "vercel --prod"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "vercel",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {}
+}
