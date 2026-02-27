@@ -3,7 +3,7 @@
 const TELEGRAM_API = "https://api.telegram.org";
 
 // Память сессий (ограниченная и недолговечная — живет пока «теплый» инстанс функции)
-// Ключ: chatId, значение: { history, model, awaitImagePrompt?, awaitVideoPrompt?, videoProvider?, videoTemplate? }
+// Ключ: chatId, значение: { history, model, awaitImagePrompt?, awaitImageRef?, imageRefUrl?, imageModel?, awaitVideoPrompt?, videoProvider?, videoTemplate? }
 const sessions = new Map();
 
 // Подписки: userId -> { expiresAt: number (ms), plan: string }. In-memory; для продакшена лучше Vercel KV/DB.
@@ -338,13 +338,84 @@ function buildBackToMenuKeyboard() {
 }
 
 // ——— Генерация изображений (Google Imagen / Gemini) ———
-const GOOGLE_IMAGEN_MODEL = "imagen-3.0-generate-002";
-async function generateImageWithGoogle(prompt) {
+const IMAGE_MODELS = {
+  "imagen-3.0-generate-002": "Imagen 3",
+  "imagen-3.0-fast-generate-001": "Imagen 3 Fast"
+};
+const DEFAULT_IMAGE_MODEL = "imagen-3.0-generate-002";
+
+function buildImageSubMenuKeyboard(currentModel) {
+  const modelId = currentModel || DEFAULT_IMAGE_MODEL;
+  const rows = [
+    [{ text: "📝 Только по описанию", callback_data: "img_text_only" }],
+    [{ text: "🖼 С референсом (загрузить своё фото)", callback_data: "img_with_ref" }],
+    [
+      {
+        text: (modelId === "imagen-3.0-generate-002" ? "✓ " : "") + (IMAGE_MODELS["imagen-3.0-generate-002"] || "Imagen 3"),
+        callback_data: "img_model_imagen-3.0-generate-002"
+      },
+      {
+        text: (modelId === "imagen-3.0-fast-generate-001" ? "✓ " : "") + (IMAGE_MODELS["imagen-3.0-fast-generate-001"] || "Imagen 3 Fast"),
+        callback_data: "img_model_imagen-3.0-fast-generate-001"
+      }
+    ],
+    [{ text: "◀ В меню", callback_data: "menu_main" }]
+  ];
+  return { inline_keyboard: rows };
+}
+
+async function generateImageWithGoogle(prompt, modelId, referenceImageUrl) {
   const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
   if (!apiKey) return { ok: false, error: "GOOGLE_GENERATIVE_AI_API_KEY не задан." };
+  const model = modelId || DEFAULT_IMAGE_MODEL;
+
+  if (referenceImageUrl) {
+    try {
+      const imageRes = await fetch(referenceImageUrl);
+      if (!imageRes.ok) return { ok: false, error: "Не удалось загрузить референс." };
+      const imageBytes = await imageRes.arrayBuffer();
+      const imageB64 = Buffer.from(imageBytes).toString("base64");
+      const mimeType = imageRes.headers.get("content-type") || "image/jpeg";
+      const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  { inlineData: { mimeType, data: imageB64 } },
+                  { text: `Создай новое изображение по описанию, используя это фото как референс (стиль/объект): ${prompt}` }
+                ]
+              }
+            ],
+            generationConfig: { responseModalities: ["TEXT", "IMAGE"] }
+          })
+        }
+      );
+      if (!geminiRes.ok) {
+        const err = await geminiRes.text();
+        console.error("Gemini image gen error:", err);
+        return { ok: false, error: "Ошибка генерации по референсу. Попробуй без референса или другую модель." };
+      }
+      const data = await geminiRes.json();
+      const part = data.candidates?.[0]?.content?.parts?.find((p) => p.inlineData);
+      const b64 = part?.inlineData?.data;
+      if (!b64) return { ok: false, error: "Нет изображения в ответе." };
+      return { ok: true, buffer: Buffer.from(b64, "base64") };
+    } catch (e) {
+      console.error("Gemini ref image failed:", e);
+      return { ok: false, error: "Ошибка при генерации по референсу." };
+    }
+  }
 
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GOOGLE_IMAGEN_MODEL}:predict`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:predict`;
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -635,14 +706,59 @@ module.exports = async (req, res) => {
     }
 
     if (cbData === "menu_image") {
-      getSession(chatId).awaitImagePrompt = true;
+      const session = getSession(chatId);
+      const modelId = session.imageModel || DEFAULT_IMAGE_MODEL;
       await editMessageText(
         token,
         chatId,
         messageId,
-        "🖼 *Генерация фото* (Google Imagen)\n\nНапиши текстом описание картинки — пришлю изображение. Только для подписчиков.",
+        `🖼 *Генерация фото*\nТип: только описание или с референсом. Модель: *${IMAGE_MODELS[modelId] || modelId}*.`,
+        buildImageSubMenuKeyboard(modelId)
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    if (cbData === "img_text_only") {
+      getSession(chatId).awaitImagePrompt = true;
+      getSession(chatId).awaitImageRef = false;
+      getSession(chatId).imageRefUrl = undefined;
+      const modelId = getSession(chatId).imageModel || DEFAULT_IMAGE_MODEL;
+      await editMessageText(
+        token,
+        chatId,
+        messageId,
+        `📝 Напиши описание картинки. Модель: *${IMAGE_MODELS[modelId] || modelId}*.`,
         buildBackToMenuKeyboard()
       );
+      return res.status(200).json({ ok: true });
+    }
+
+    if (cbData === "img_with_ref") {
+      getSession(chatId).awaitImageRef = true;
+      getSession(chatId).awaitImagePrompt = false;
+      getSession(chatId).imageRefUrl = undefined;
+      await editMessageText(
+        token,
+        chatId,
+        messageId,
+        "🖼 Сначала отправь *одно фото* как референс (стиль или объект). Потом напишешь описание.",
+        buildBackToMenuKeyboard()
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    if (cbData && cbData.startsWith("img_model_")) {
+      const modelId = cbData.replace("img_model_", "");
+      if (IMAGE_MODELS[modelId]) {
+        getSession(chatId).imageModel = modelId;
+        await editMessageText(
+          token,
+          chatId,
+          messageId,
+          `Модель: *${IMAGE_MODELS[modelId]}*. Выбери тип генерации выше или напиши описание.`,
+          buildImageSubMenuKeyboard(modelId)
+        );
+      }
       return res.status(200).json({ ok: true });
     }
 
@@ -776,9 +892,33 @@ module.exports = async (req, res) => {
     return res.status(200).json({ ok: true });
   }
 
-  // ——— Генерация фото по запросу (после нажатия «Генерация фото») ———
+  // ——— Режим «референс»: пользователь отправил фото как референс ———
+  if (session.awaitImageRef && Array.isArray(photos) && photos.length > 0) {
+    const largestPhoto = photos[photos.length - 1];
+    const fileUrl = await getFileUrl(token, largestPhoto.file_id);
+    if (fileUrl) {
+      session.imageRefUrl = fileUrl;
+      session.awaitImageRef = false;
+      session.awaitImagePrompt = true;
+      const modelId = session.imageModel || DEFAULT_IMAGE_MODEL;
+      await sendTelegramMessage(
+        token,
+        chatId,
+        `Референс сохранён. Напиши описание картинки (в стиле этого фото или с этим объектом). Модель: *${IMAGE_MODELS[modelId] || modelId}*.`,
+        { reply_markup: buildBackToMenuKeyboard() }
+      );
+    } else {
+      await sendTelegramMessage(token, chatId, "Не получилось загрузить фото. Попробуй ещё раз.");
+    }
+    return res.status(200).json({ ok: true });
+  }
+
+  // ——— Генерация фото по запросу (после выбора типа и/или референса) ———
   if (session.awaitImagePrompt && typeof text === "string" && text.trim()) {
+    const modelId = session.imageModel || DEFAULT_IMAGE_MODEL;
+    const refUrl = session.imageRefUrl;
     session.awaitImagePrompt = false;
+    session.imageRefUrl = undefined;
     const hasSub = (await hasActiveSubscription(fromUserId)) || isAdmin;
     if (!hasSub) {
       await sendTelegramMessage(
@@ -789,8 +929,12 @@ module.exports = async (req, res) => {
       );
       return res.status(200).json({ ok: true });
     }
-    await sendTelegramMessage(token, chatId, "Генерирую картинку…");
-    const result = await generateImageWithGoogle(text.trim());
+    await sendTelegramMessage(
+      token,
+      chatId,
+      refUrl ? "Генерирую картинку по референсу…" : "Генерирую картинку…"
+    );
+    const result = await generateImageWithGoogle(text.trim(), modelId, refUrl);
     if (!result.ok) {
       await sendTelegramMessage(token, chatId, `Ошибка: ${result.error}`);
       return res.status(200).json({ ok: true });
