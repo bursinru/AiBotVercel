@@ -25,25 +25,28 @@ vercel
 
 ### 3. Переменные окружения
 
-Необходимо задать как минимум один токен:
+Обязательно:
 
 - `TELEGRAM_BOT_TOKEN` — токен бота от BotFather
-- `OPENAI_API_KEY` — (опционально) ключ OpenAI. Если его не задать, бот будет делать простой эхо-ответ с подсказкой.
 
-Для локальной разработки можно создать файл `.env.local` (не коммить в git):
+Опционально:
 
-```bash
-TELEGRAM_BOT_TOKEN=ваш_telegram_токен
-OPENAI_API_KEY=ваш_openai_ключ
-```
+- `OPENAI_API_KEY` — ключ OpenAI для чата с AI (без него — эхо-режим).
+- `GOOGLE_GENERATIVE_AI_API_KEY` — ключ [Google AI Studio](https://aistudio.google.com/apikey) для генерации фото (Imagen). Без него кнопка «Генерация фото» будет требовать подписку, но генерация не заработает без ключа.
+- `YOOKASSA_SHOP_ID`, `YOOKASSA_SECRET` — для приёма оплаты подписки (ЮKassa). Без них подписку оформить нельзя.
+- `YOOKASSA_RETURN_URL` — URL после оплаты (по умолчанию `https://t.me/ИМЯ_БОТА`).
+- `TELEGRAM_ADMIN_ID` — Telegram ID админа (по умолчанию зашит один ID). Админ видит кнопку «Админка», команды /style, /fetch, /code и может генерировать фото/видео без подписки.
+- `VIDEO_TEMPLATE_JOSEPHPEACH88_URL` — публичный URL изображения человека для шаблона Sora «@josephpeach88». Если задан, при выборе «Sora с шаблоном @josephpeach88» этот URL передаётся в Sora как `input_reference`.
 
-На Vercel задайте переменные окружения в настройках проекта (`Environment Variables`).
+Для подписок между инстансами нужен **Vercel KV**: создай KV Store в Vercel и подключи к проекту — тогда данные подписок сохраняются после вебхука ЮKassa.
+
+Для локальной разработки можно создать файл `.env.local` (не коммить в git). На Vercel задайте переменные в настройках проекта (`Environment Variables`).
 
 ### 4. Структура проекта
 
-- `api/telegram.js` — серверлес-функция, которую вызывает Telegram (вебхук).
-- `vercel.json` — конфигурация функций Vercel (runtime Node.js 18).
-- `package.json` — базовый пакетный файл проекта.
+- `api/telegram.js` — вебхук бота: меню, чат с AI, генерация фото (Google Imagen), подписки, админка.
+- `api/yookassa.js` — вебхук ЮKassa: при успешной оплате активирует подписку и пишет пользователю в Telegram.
+- `package.json` — зависимости: `@vercel/kv`, `form-data`.
 
 ### 5. Локальный запуск (через Vercel Dev)
 
@@ -73,16 +76,13 @@ curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
 - `<TELEGRAM_BOT_TOKEN>` на реальный токен
 - `https://your-project-name.vercel.app` на реальный Vercel URL
 
-### 7. Как это работает
+### 7. Меню, подписки и ЮKassa
 
-1. Пользователь пишет сообщение боту в Telegram.
-2. Telegram отправляет `POST` запрос на ваш вебхук `/api/telegram`.
-3. Функция из `api/telegram.js`:
-   - Парсит апдейт и извлекает `chat_id` и `text`.
-   - Вызывает `callAi(text)`, который:
-     - Если задан `OPENAI_API_KEY`, обращается к OpenAI Chat Completions (`gpt-4.1-mini`).
-     - Если ключа нет — возвращает простой эхо-текст.
-   - Отправляет ответ обратно в чат с помощью `sendMessage`.
+- **Меню**: по `/start` показывается inline-меню (Чат с AI, Генерация фото, Подписка, Профиль; у админа — Админка).
+- **Генерация фото**: кнопка «Генерация фото» → пользователь пишет описание → бот вызывает Google Imagen API и отправляет картинку. Доступно по подписке (админ — без подписки).
+- **Генерация видео**: в меню две опции — **Sora** (OpenAI) и **Veo 3** (Google). Для Sora можно выбрать «обычное видео» или «с шаблоном @josephpeach88» (референс человека): в env задаётся `VIDEO_TEMPLATE_JOSEPHPEACH88_URL` — публичный URL картинки человека, Sora использует его как `input_reference`. Veo 3 вызывается через Gemini API (`GOOGLE_GENERATIVE_AI_API_KEY`), модель `veo-3.1-generate-preview`. Доступ по подписке (админ — без подписки).
+- **Подписки**: кнопка «Подписка» → выбор тарифа (1 мес / 3 мес) → создаётся платёж ЮKassa, пользователь переходит по ссылке и платит. После оплаты ЮKassa шлёт вебхук на `POST /api/yookassa`; бот активирует подписку (Vercel KV) и пишет пользователю в Telegram.
+- **Вебхук ЮKassa**: в [кабинете ЮKassa](https://yookassa.ru/my/merchant/integration/http-notifications) укажи URL: `https://ВАШ-ДОМЕН.vercel.app/api/yookassa`.
 
 ### 8. Деплой на Vercel
 
