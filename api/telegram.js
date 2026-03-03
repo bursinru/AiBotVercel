@@ -53,24 +53,51 @@ async function setSubscription(userId, data) {
   subscriptions.set(String(userId), data);
   if (kv) await kv.set(`sub:${userId}`, data);
 }
+
+const DEFAULT_TOPIC_NAMES = ["Общий", "Помощь", "Идеи"];
+
+async function getTopics(chatId) {
+  if (!kv) return [];
+  const v = await kv.get(`topics:${chatId}`);
+  return Array.isArray(v) ? v : [];
+}
+
+async function setTopics(chatId, list) {
+  if (kv) await kv.set(`topics:${chatId}`, list);
+}
+
+async function ensureDefaultTopics(token, chatId) {
+  let list = await getTopics(chatId);
+  if (list.length > 0) return list;
+  for (const name of DEFAULT_TOPIC_NAMES) {
+    const res = await createForumTopic(token, chatId, name);
+    if (res.ok && res.topic?.message_thread_id) {
+      list.push({ name, message_thread_id: res.topic.message_thread_id });
+    }
+  }
+  await setTopics(chatId, list);
+  return list;
+}
+
 async function hasActiveSubscription(userId) {
   const sub = await getSubscription(userId);
   return sub && sub.expiresAt > Date.now();
 }
 
-function getSession(chatId) {
-  if (!sessions.has(chatId)) {
-    sessions.set(chatId, {
+function getSession(chatId, messageThreadId) {
+  const key = `${chatId}:${messageThreadId || 0}`;
+  if (!sessions.has(key)) {
+    sessions.set(key, {
       history: [],
       model: DEFAULT_MODEL,
       egorMoscowGreeted: false
     });
   }
-  return sessions.get(chatId);
+  return sessions.get(key);
 }
 
-function resetSession(chatId) {
-  sessions.delete(chatId);
+function resetSession(chatId, messageThreadId) {
+  sessions.delete(`${chatId}:${messageThreadId || 0}`);
 }
 
 function buildSystemPrompt() {
@@ -82,8 +109,8 @@ function buildSystemPrompt() {
   return `${base}\n\nДополнительный стиль общения (глобально): ${style}`;
 }
 
-function buildChatMessages(chatId, userContentParts) {
-  const session = getSession(chatId);
+function buildChatMessages(chatId, userContentParts, messageThreadId) {
+  const session = getSession(chatId, messageThreadId);
   return [
     { role: "system", content: buildSystemPrompt() },
     ...session.history,
@@ -91,15 +118,15 @@ function buildChatMessages(chatId, userContentParts) {
   ];
 }
 
-async function callAi({ chatId, userContentParts }) {
+async function callAi({ chatId, userContentParts, messageThreadId }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return `Я пока работаю в упрощённом режиме без AI. Чтобы включить полноценные ответы, задай переменную окружения OPENAI_API_KEY. Ты написал: "${userContentParts.map(p => (typeof p === "string" ? p : "[медиа]")).join(" ")}"`;
   }
 
-  const session = getSession(chatId);
+  const session = getSession(chatId, messageThreadId);
   const model = session.model || DEFAULT_MODEL;
-  const messages = buildChatMessages(chatId, userContentParts);
+  const messages = buildChatMessages(chatId, userContentParts, messageThreadId);
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -133,7 +160,7 @@ async function callAi({ chatId, userContentParts }) {
 
 const DRAFT_THROTTLE_MS = 180;
 
-async function callAiStream({ chatId, userContentParts, onChunk }) {
+async function callAiStream({ chatId, userContentParts, onChunk, messageThreadId }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     const fallback = `Я пока работаю в упрощённом режиме без AI. Ты написал: "${userContentParts.map(p => (typeof p === "string" ? p : "[медиа]")).join(" ")}"`;
@@ -141,9 +168,9 @@ async function callAiStream({ chatId, userContentParts, onChunk }) {
     return fallback;
   }
 
-  const session = getSession(chatId);
+  const session = getSession(chatId, messageThreadId);
   const model = session.model || DEFAULT_MODEL;
-  const messages = buildChatMessages(chatId, userContentParts);
+  const messages = buildChatMessages(chatId, userContentParts, messageThreadId);
 
   let accumulated = "";
   let lastEmit = 0;
@@ -236,34 +263,26 @@ async function callAiStream({ chatId, userContentParts, onChunk }) {
 
 async function sendTelegramMessage(token, chatId, text, extra = {}) {
   const url = `${TELEGRAM_API}/bot${token}/sendMessage`;
+  const body = { chat_id: chatId, text, parse_mode: "Markdown", ...extra };
+  if (body.message_thread_id == null) delete body.message_thread_id;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "Markdown",
-      ...extra
-    })
+    body: JSON.stringify(body)
   });
-
-  if (!res.ok) {
-    console.error("Failed to send Telegram message:", await res.text());
-  }
+  if (!res.ok) console.error("Failed to send Telegram message:", await res.text());
 }
 
 // Черновик (стриминг): показ процесса генерации ответа. Текст до 4096 символов.
-async function sendMessageDraft(token, chatId, draftId, text) {
+async function sendMessageDraft(token, chatId, draftId, text, messageThreadId) {
   const url = `${TELEGRAM_API}/bot${token}/sendMessageDraft`;
   const truncated = String(text).slice(0, 4096);
+  const body = { chat_id: chatId, draft_id: draftId, text: truncated || "…" };
+  if (messageThreadId != null) body.message_thread_id = messageThreadId;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      draft_id: draftId,
-      text: truncated || "…"
-    })
+    body: JSON.stringify(body)
   });
   if (!res.ok) console.error("sendMessageDraft error:", await res.text());
 }
@@ -436,7 +455,7 @@ async function fetchTextFromUrl(url) {
 }
 
 // ——— Меню (inline) ———
-function buildMainMenuKeyboard(isAdmin) {
+function buildMainMenuKeyboard(isAdmin, isPrivate = false) {
   const rows = [
     [{ text: "💬 Чат с AI", callback_data: "menu_chat" }],
     [{ text: "🖼 Генерация фото", callback_data: "menu_image" }],
@@ -449,7 +468,15 @@ function buildMainMenuKeyboard(isAdmin) {
       { text: "👤 Профиль", callback_data: "menu_profile" }
     ]
   ];
+  if (isPrivate) rows.push([{ text: "💭 Топики", callback_data: "topic_list" }]);
   if (isAdmin) rows.push([{ text: "⚙ Админка", callback_data: "menu_admin" }]);
+  return { inline_keyboard: rows };
+}
+
+function buildTopicsKeyboard(topics) {
+  const rows = topics.map((t) => [{ text: `# ${t.name}`, callback_data: `topic_open_${t.message_thread_id}` }]);
+  rows.push([{ text: "➕ Новый топик", callback_data: "topic_new" }]);
+  rows.push([{ text: "◀ В меню", callback_data: "menu_main" }]);
   return { inline_keyboard: rows };
 }
 
@@ -817,24 +844,26 @@ module.exports = async (req, res) => {
     const cbData = callbackQuery.data;
     const chatId = callbackQuery.message?.chat?.id;
     const messageId = callbackQuery.message?.message_id;
+    const cbThreadId = callbackQuery.message?.message_thread_id;
     const fromUserId = callbackQuery.from?.id;
     const isAdmin = isAdminUser(fromUserId);
 
     await answerCallbackQuery(token, callbackQuery.id);
 
     if (cbData === "menu_main" || cbData === "menu_chat") {
+      const isPrivateChat = callbackQuery.message?.chat?.type === "private";
       await editMessageText(
         token,
         chatId,
         messageId,
         "Главное меню. Пиши сюда для чата с AI или выбери действие ниже.",
-        buildMainMenuKeyboard(isAdmin)
+        buildMainMenuKeyboard(isAdmin, isPrivateChat)
       );
       return res.status(200).json({ ok: true });
     }
 
     if (cbData === "menu_image") {
-      const session = getSession(chatId);
+      const session = getSession(chatId, cbThreadId);
       const modelId = session.imageModel || DEFAULT_IMAGE_MODEL;
       await editMessageText(
         token,
@@ -847,10 +876,11 @@ module.exports = async (req, res) => {
     }
 
     if (cbData === "img_text_only") {
-      getSession(chatId).awaitImagePrompt = true;
-      getSession(chatId).awaitImageRef = false;
-      getSession(chatId).imageRefUrl = undefined;
-      const modelId = getSession(chatId).imageModel || DEFAULT_IMAGE_MODEL;
+      const s = getSession(chatId, cbThreadId);
+      s.awaitImagePrompt = true;
+      s.awaitImageRef = false;
+      s.imageRefUrl = undefined;
+      const modelId = s.imageModel || DEFAULT_IMAGE_MODEL;
       await editMessageText(
         token,
         chatId,
@@ -862,9 +892,10 @@ module.exports = async (req, res) => {
     }
 
     if (cbData === "img_with_ref") {
-      getSession(chatId).awaitImageRef = true;
-      getSession(chatId).awaitImagePrompt = false;
-      getSession(chatId).imageRefUrl = undefined;
+      const s = getSession(chatId, cbThreadId);
+      s.awaitImageRef = true;
+      s.awaitImagePrompt = false;
+      s.imageRefUrl = undefined;
       await editMessageText(
         token,
         chatId,
@@ -878,7 +909,7 @@ module.exports = async (req, res) => {
     if (cbData && cbData.startsWith("img_model_")) {
       const modelId = cbData.replace("img_model_", "");
       if (IMAGE_MODELS[modelId]) {
-        getSession(chatId).imageModel = modelId;
+        getSession(chatId, cbThreadId).imageModel = modelId;
         await editMessageText(
           token,
           chatId,
@@ -902,7 +933,7 @@ module.exports = async (req, res) => {
     }
 
     if (cbData === "video_sora" || cbData === "video_sora_josephpeach88") {
-      const session = getSession(chatId);
+      const session = getSession(chatId, cbThreadId);
       session.awaitVideoPrompt = true;
       session.videoProvider = "sora";
       session.videoTemplate = cbData === "video_sora_josephpeach88" ? "josephpeach88" : "";
@@ -923,9 +954,10 @@ module.exports = async (req, res) => {
     }
 
     if (cbData === "menu_video_veo") {
-      getSession(chatId).awaitVideoPrompt = true;
-      getSession(chatId).videoProvider = "veo3";
-      getSession(chatId).videoTemplate = "";
+      const s = getSession(chatId, cbThreadId);
+      s.awaitVideoPrompt = true;
+      s.videoProvider = "veo3";
+      s.videoTemplate = "";
       await editMessageText(
         token,
         chatId,
@@ -997,19 +1029,66 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    if (cbData === "topic_list") {
+      const isPrivate = callbackQuery.message?.chat?.type === "private";
+      if (!isPrivate) {
+        await editMessageText(token, chatId, messageId, "Топики доступны только в личном чате с ботом.", buildBackToMenuKeyboard());
+        return res.status(200).json({ ok: true });
+      }
+      const topics = await ensureDefaultTopics(token, chatId);
+      await editMessageText(
+        token,
+        chatId,
+        messageId,
+        "💭 *Топики*\nВыбери топик или создай новый. В каждом топике — своя история диалога.",
+        buildTopicsKeyboard(topics)
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    if (cbData && cbData.startsWith("topic_open_")) {
+      const threadId = parseInt(cbData.replace("topic_open_", ""), 10);
+      const topics = await getTopics(chatId);
+      const topic = topics.find((t) => t.message_thread_id === threadId);
+      const name = topic?.name || "Топик";
+      await sendTelegramMessage(token, chatId, `Пиши здесь — ответы пойдут в топик «${name}».`, {
+        message_thread_id: threadId
+      });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (cbData === "topic_new") {
+      const isPrivate = callbackQuery.message?.chat?.type === "private";
+      if (!isPrivate) {
+        await editMessageText(token, chatId, messageId, "Топики доступны только в личном чате.", buildBackToMenuKeyboard());
+        return res.status(200).json({ ok: true });
+      }
+      getSession(chatId, cbThreadId).awaitTopicName = true;
+      await editMessageText(
+        token,
+        chatId,
+        messageId,
+        "➕ Введите название нового топика (1–128 символов).",
+        buildBackToMenuKeyboard()
+      );
+      return res.status(200).json({ ok: true });
+    }
+
     return res.status(200).json({ ok: true });
   }
 
   const message = update?.message;
   const fromUserId = message?.from?.id;
   const chatId = message?.chat?.id;
+  const threadId = message?.message_thread_id;
+  const isPrivate = message?.chat?.type === "private";
 
   if (!chatId || !message) {
     return res.status(200).json({ ok: true });
   }
 
   const isAdmin = isAdminUser(fromUserId);
-  const session = getSession(chatId);
+  const session = getSession(chatId, threadId);
   const text = message.text;
   const photos = message.photo;
 
@@ -1160,12 +1239,16 @@ module.exports = async (req, res) => {
         token,
         chatId,
         `Привет, ${name}. Выбери действие в меню ниже.`,
-        { reply_markup: buildMainMenuKeyboard(isAdmin) }
+        { reply_markup: buildMainMenuKeyboard(isAdmin, isPrivate) }
       );
       return res.status(200).json({ ok: true });
     }
 
     if (text.startsWith("/topic")) {
+      if (!isPrivate) {
+        await sendTelegramMessage(token, chatId, "Топики доступны только в личном чате с ботом.");
+        return res.status(200).json({ ok: true });
+      }
       const rest = text.replace(/^\/topic\s*/i, "").trim();
       if (!rest) {
         await sendTelegramMessage(
@@ -1173,7 +1256,7 @@ module.exports = async (req, res) => {
           chatId,
           "Использование: /topic <название топика> [цвет]\nЦвет — число из: " +
             FORUM_TOPIC_ICON_COLORS.join(", ") +
-            ". Работает только в супергруппе-форуме, бот должен быть админом с правом «Управление топиками»."
+            ". В личном чате топики создаются через меню «Топики» или фразой «создай топик Название»."
         );
         return res.status(200).json({ ok: true });
       }
@@ -1196,6 +1279,9 @@ module.exports = async (req, res) => {
         await sendTelegramMessage(token, chatId, `Ошибка: ${result.error}`);
         return res.status(200).json({ ok: true });
       }
+      const list = await getTopics(chatId);
+      list.push({ name, message_thread_id: result.topic.message_thread_id });
+      await setTopics(chatId, list);
       await sendTelegramMessage(
         token,
         chatId,
@@ -1226,8 +1312,8 @@ module.exports = async (req, res) => {
     }
 
     if (text.startsWith("/reset")) {
-      resetSession(chatId);
-      await sendTelegramMessage(token, chatId, "Память диалога очищена. Начнём заново 🙂");
+      resetSession(chatId, threadId);
+      await sendTelegramMessage(token, chatId, "Память диалога очищена. Начнём заново 🙂", threadId ? { message_thread_id: threadId } : {});
       return res.status(200).json({ ok: true });
     }
 
@@ -1306,8 +1392,8 @@ module.exports = async (req, res) => {
             `Текст страницы (обрезан):\n${r.text}`
         }
       ];
-      const replyText = await callAi({ chatId, userContentParts });
-      await sendTelegramMessage(token, chatId, replyText);
+      const replyText = await callAi({ chatId, userContentParts, messageThreadId: threadId });
+      await sendTelegramMessage(token, chatId, replyText, threadId ? { message_thread_id: threadId } : {});
       return res.status(200).json({ ok: true });
     }
 
@@ -1332,11 +1418,12 @@ module.exports = async (req, res) => {
             `Задача: ${codeCmd.instruction}`
         }
       ];
-      const replyText = await callAi({ chatId, userContentParts });
+      const replyText = await callAi({ chatId, userContentParts, messageThreadId: threadId });
       await sendTelegramMessage(
         token,
         chatId,
-        replyText.length > 3500 ? replyText.slice(0, 3500) + "\n\n(обрезано)" : replyText
+        replyText.length > 3500 ? replyText.slice(0, 3500) + "\n\n(обрезано)" : replyText,
+        threadId ? { message_thread_id: threadId } : {}
       );
       return res.status(200).json({ ok: true });
     }
@@ -1344,7 +1431,7 @@ module.exports = async (req, res) => {
     const modelCmd = parseModelCommand(text);
     if (modelCmd) {
       if (modelCmd.action === "show") {
-        const current = getSession(chatId).model || DEFAULT_MODEL;
+        const current = getSession(chatId, threadId).model || DEFAULT_MODEL;
         await sendTelegramMessage(
           token,
           chatId,
@@ -1376,7 +1463,7 @@ module.exports = async (req, res) => {
           return res.status(200).json({ ok: true });
         }
 
-        const s = getSession(chatId);
+        const s = getSession(chatId, threadId);
         s.model = normalized;
         await sendTelegramMessage(
           token,
@@ -1423,26 +1510,58 @@ module.exports = async (req, res) => {
     ];
 
     const draftId = Math.max(1, Math.abs((Date.now() >>> 0) % 0x7FFFFFFF));
-    await sendMessageDraft(token, chatId, draftId, "…");
+    await sendMessageDraft(token, chatId, draftId, "…", threadId);
     const replyText = await callAiStream({
       chatId,
       userContentParts,
-      onChunk: (chunk) => sendMessageDraft(token, chatId, draftId, chunk)
+      messageThreadId: threadId,
+      onChunk: (chunk) => sendMessageDraft(token, chatId, draftId, chunk, threadId)
     });
-    await sendMessageDraft(token, chatId, draftId, replyText);
+    await sendMessageDraft(token, chatId, draftId, replyText, threadId);
 
     return res.status(200).json({ ok: true });
   }
 
-  // Запрос на создание топика фразой («создай топик Название»)
+  // Ввод названия нового топика (после нажатия «Новый топик»)
+  if (session.awaitTopicName && typeof text === "string" && text.trim().length > 0) {
+    session.awaitTopicName = false;
+    const name = text.trim().slice(0, 128);
+    if (!isPrivate) {
+      await sendTelegramMessage(token, chatId, "Топики доступны только в личном чате с ботом.");
+      return res.status(200).json({ ok: true });
+    }
+    const result = await createForumTopic(token, chatId, name);
+    if (!result.ok) {
+      await sendTelegramMessage(token, chatId, `Ошибка: ${result.error}`);
+      return res.status(200).json({ ok: true });
+    }
+    const list = await getTopics(chatId);
+    list.push({ name, message_thread_id: result.topic.message_thread_id });
+    await setTopics(chatId, list);
+    await sendTelegramMessage(token, chatId, `Топик «${name}» создан. Пиши здесь — ответы пойдут в этот топик.`, {
+      message_thread_id: result.topic.message_thread_id
+    });
+    return res.status(200).json({ ok: true });
+  }
+
+  // Запрос на создание топика фразой («создай топик Название») — только в личном чате
   if (typeof text === "string" && text.trim().length > 0) {
     const topicMatch = text.match(/^(?:создай|создать)\s+топик\s*[:\s]\s*(.+)$/i) || text.match(/^create\s+topic\s*[:\s]\s*(.+)$/i);
     if (topicMatch) {
+      if (!isPrivate) {
+        await sendTelegramMessage(token, chatId, "Топики доступны только в личном чате с ботом.");
+        return res.status(200).json({ ok: true });
+      }
       const name = topicMatch[1].trim().slice(0, 128);
       if (name) {
         const result = await createForumTopic(token, chatId, name);
         if (result.ok) {
-          await sendTelegramMessage(token, chatId, `Топик «${name}» создан.`);
+          const list = await getTopics(chatId);
+          list.push({ name, message_thread_id: result.topic.message_thread_id });
+          await setTopics(chatId, list);
+          await sendTelegramMessage(token, chatId, `Топик «${name}» создан.`, {
+            message_thread_id: result.topic.message_thread_id
+          });
         } else {
           await sendTelegramMessage(token, chatId, `Не удалось создать топик: ${result.error}`);
         }
@@ -1455,13 +1574,14 @@ module.exports = async (req, res) => {
   if (typeof text === "string" && text.trim().length > 0) {
     const userContentParts = [{ type: "text", text }];
     const draftId = Math.max(1, Math.abs((Date.now() >>> 0) % 0x7FFFFFFF));
-    await sendMessageDraft(token, chatId, draftId, "…");
+    await sendMessageDraft(token, chatId, draftId, "…", threadId);
     const replyText = await callAiStream({
       chatId,
       userContentParts,
-      onChunk: (chunk) => sendMessageDraft(token, chatId, draftId, chunk)
+      messageThreadId: threadId,
+      onChunk: (chunk) => sendMessageDraft(token, chatId, draftId, chunk, threadId)
     });
-    await sendMessageDraft(token, chatId, draftId, replyText);
+    await sendMessageDraft(token, chatId, draftId, replyText, threadId);
 
     return res.status(200).json({ ok: true });
   }
