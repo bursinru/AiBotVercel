@@ -82,27 +82,24 @@ function buildSystemPrompt() {
   return `${base}\n\nДополнительный стиль общения (глобально): ${style}`;
 }
 
+function buildChatMessages(chatId, userContentParts) {
+  const session = getSession(chatId);
+  return [
+    { role: "system", content: buildSystemPrompt() },
+    ...session.history,
+    { role: "user", content: userContentParts }
+  ];
+}
+
 async function callAi({ chatId, userContentParts }) {
   const apiKey = process.env.OPENAI_API_KEY;
-
   if (!apiKey) {
     return `Я пока работаю в упрощённом режиме без AI. Чтобы включить полноценные ответы, задай переменную окружения OPENAI_API_KEY. Ты написал: "${userContentParts.map(p => (typeof p === "string" ? p : "[медиа]")).join(" ")}"`;
   }
 
   const session = getSession(chatId);
   const model = session.model || DEFAULT_MODEL;
-
-  const messages = [
-    {
-      role: "system",
-      content: buildSystemPrompt()
-    },
-    ...session.history,
-    {
-      role: "user",
-      content: userContentParts
-    }
-  ];
+  const messages = buildChatMessages(chatId, userContentParts);
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -111,10 +108,7 @@ async function callAi({ chatId, userContentParts }) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`
       },
-      body: JSON.stringify({
-        model,
-        messages
-      })
+      body: JSON.stringify({ model, messages })
     });
 
     if (!response.ok) {
@@ -125,25 +119,118 @@ async function callAi({ chatId, userContentParts }) {
     const data = await response.json();
     const answer = data.choices?.[0]?.message?.content?.trim() || "Не получилось сгенерировать ответ.";
 
-    // Обновляем историю (ограничиваем длину, чтобы не раздувать контекст)
     session.history.push(
-      {
-        role: "user",
-        content: userContentParts
-      },
-      {
-        role: "assistant",
-        content: answer
-      }
+      { role: "user", content: userContentParts },
+      { role: "assistant", content: answer }
     );
-    if (session.history.length > 20) {
-      session.history = session.history.slice(-20);
-    }
-
+    if (session.history.length > 20) session.history = session.history.slice(-20);
     return answer;
   } catch (err) {
     console.error("OpenAI request failed:", err);
     return "Не удалось связаться с AI-сервисом.";
+  }
+}
+
+const DRAFT_THROTTLE_MS = 180;
+
+async function callAiStream({ chatId, userContentParts, onChunk }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    const fallback = `Я пока работаю в упрощённом режиме без AI. Ты написал: "${userContentParts.map(p => (typeof p === "string" ? p : "[медиа]")).join(" ")}"`;
+    if (onChunk) onChunk(fallback);
+    return fallback;
+  }
+
+  const session = getSession(chatId);
+  const model = session.model || DEFAULT_MODEL;
+  const messages = buildChatMessages(chatId, userContentParts);
+
+  let accumulated = "";
+  let lastEmit = 0;
+
+  const emit = (text) => {
+    if (!onChunk) return;
+    const now = Date.now();
+    if (now - lastEmit >= DRAFT_THROTTLE_MS || text.endsWith("\n")) {
+      lastEmit = now;
+      onChunk(text);
+    }
+  };
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({ model, messages, stream: true })
+    });
+
+    if (!response.ok) {
+      const err = "Произошла ошибка при обращении к AI.";
+      if (onChunk) onChunk(err);
+      return err;
+    }
+
+    const body = response.body;
+    if (!body) {
+      const err = "Не удалось прочитать поток ответа.";
+      if (onChunk) onChunk(err);
+      return err;
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let done = false;
+    while (!done) {
+      const { value, done: d } = await reader.read();
+      done = d;
+      if (value) buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6);
+          if (data === "[DONE]") continue;
+          try {
+            const json = JSON.parse(data);
+            const delta = json.choices?.[0]?.delta?.content;
+            if (typeof delta === "string") {
+              accumulated += delta;
+              emit(accumulated);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    if (buffer.startsWith("data: ")) {
+      try {
+        const data = buffer.slice(6);
+        if (data !== "[DONE]") {
+          const json = JSON.parse(data);
+          if (json?.choices?.[0]?.delta?.content) {
+            accumulated += json.choices[0].delta.content;
+          }
+        }
+      } catch (_) {}
+    }
+
+    const answer = accumulated.trim() || "Не получилось сгенерировать ответ.";
+    if (onChunk) onChunk(answer);
+
+    session.history.push(
+      { role: "user", content: userContentParts },
+      { role: "assistant", content: answer }
+    );
+    if (session.history.length > 20) session.history = session.history.slice(-20);
+    return answer;
+  } catch (err) {
+    console.error("OpenAI stream failed:", err);
+    const errMsg = "Не удалось связаться с AI-сервисом.";
+    if (onChunk) onChunk(errMsg);
+    return errMsg;
   }
 }
 
@@ -163,6 +250,47 @@ async function sendTelegramMessage(token, chatId, text, extra = {}) {
   if (!res.ok) {
     console.error("Failed to send Telegram message:", await res.text());
   }
+}
+
+// Черновик (стриминг): показ процесса генерации ответа. Текст до 4096 символов.
+async function sendMessageDraft(token, chatId, draftId, text) {
+  const url = `${TELEGRAM_API}/bot${token}/sendMessageDraft`;
+  const truncated = String(text).slice(0, 4096);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      draft_id: draftId,
+      text: truncated || "…"
+    })
+  });
+  if (!res.ok) console.error("sendMessageDraft error:", await res.text());
+}
+
+// Цвета иконки топика (createForumTopic). Допустимые значения Telegram.
+const FORUM_TOPIC_ICON_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
+
+async function createForumTopic(token, chatId, name, iconColor, iconCustomEmojiId) {
+  const url = `${TELEGRAM_API}/bot${token}/createForumTopic`;
+  const body = {
+    chat_id: chatId,
+    name: String(name).slice(0, 128).trim()
+  };
+  if (iconColor != null && FORUM_TOPIC_ICON_COLORS.includes(Number(iconColor))) {
+    body.icon_color = Number(iconColor);
+  }
+  if (iconCustomEmojiId) body.icon_custom_emoji_id = String(iconCustomEmojiId);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!data.ok) {
+    return { ok: false, error: data.description || "Не удалось создать топик." };
+  }
+  return { ok: true, topic: data.result };
 }
 
 async function getFileUrl(token, fileId) {
@@ -1037,13 +1165,53 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    if (text.startsWith("/topic")) {
+      const rest = text.replace(/^\/topic\s*/i, "").trim();
+      if (!rest) {
+        await sendTelegramMessage(
+          token,
+          chatId,
+          "Использование: /topic <название топика> [цвет]\nЦвет — число из: " +
+            FORUM_TOPIC_ICON_COLORS.join(", ") +
+            ". Работает только в супергруппе-форуме, бот должен быть админом с правом «Управление топиками»."
+        );
+        return res.status(200).json({ ok: true });
+      }
+      const parts = rest.split(/\s+/);
+      let name = rest;
+      let iconColor;
+      if (parts.length >= 2) {
+        const last = parts[parts.length - 1];
+        if (/^\d+$/.test(last) && FORUM_TOPIC_ICON_COLORS.includes(Number(last))) {
+          iconColor = Number(last);
+          name = parts.slice(0, -1).join(" ").trim();
+        }
+      }
+      if (!name) {
+        await sendTelegramMessage(token, chatId, "Укажи непустое название топика.");
+        return res.status(200).json({ ok: true });
+      }
+      const result = await createForumTopic(token, chatId, name, iconColor);
+      if (!result.ok) {
+        await sendTelegramMessage(token, chatId, `Ошибка: ${result.error}`);
+        return res.status(200).json({ ok: true });
+      }
+      await sendTelegramMessage(
+        token,
+        chatId,
+        `Топик «${name}» создан.` + (result.topic?.message_thread_id ? ` ID: ${result.topic.message_thread_id}` : "")
+      );
+      return res.status(200).json({ ok: true });
+    }
+
     if (text.startsWith("/help")) {
       const baseHelp =
         "Команды:\n" +
         "• /reset — очистить память диалога (только для этого чата)\n" +
         "• /model — показать текущую модель\n" +
         "• /model list — список моделей\n" +
-        "• /model <name> — выбрать модель\n";
+        "• /model <name> — выбрать модель\n" +
+        "• /topic <название> — создать топик в форуме (в супергруппе-форуме)\n";
       const adminHelp =
         "\nАдмин:\n" +
         "• /admin — админ-меню\n" +
@@ -1254,23 +1422,46 @@ module.exports = async (req, res) => {
       }
     ];
 
-    const replyText = await callAi({ chatId, userContentParts });
-    await sendTelegramMessage(token, chatId, replyText);
+    const draftId = Math.max(1, Math.abs((Date.now() >>> 0) % 0x7FFFFFFF));
+    await sendMessageDraft(token, chatId, draftId, "…");
+    const replyText = await callAiStream({
+      chatId,
+      userContentParts,
+      onChunk: (chunk) => sendMessageDraft(token, chatId, draftId, chunk)
+    });
+    await sendMessageDraft(token, chatId, draftId, replyText);
 
     return res.status(200).json({ ok: true });
   }
 
+  // Запрос на создание топика фразой («создай топик Название»)
+  if (typeof text === "string" && text.trim().length > 0) {
+    const topicMatch = text.match(/^(?:создай|создать)\s+топик\s*[:\s]\s*(.+)$/i) || text.match(/^create\s+topic\s*[:\s]\s*(.+)$/i);
+    if (topicMatch) {
+      const name = topicMatch[1].trim().slice(0, 128);
+      if (name) {
+        const result = await createForumTopic(token, chatId, name);
+        if (result.ok) {
+          await sendTelegramMessage(token, chatId, `Топик «${name}» создан.`);
+        } else {
+          await sendTelegramMessage(token, chatId, `Не удалось создать топик: ${result.error}`);
+        }
+        return res.status(200).json({ ok: true });
+      }
+    }
+  }
+
   // Обычный текст
   if (typeof text === "string" && text.trim().length > 0) {
-    const userContentParts = [
-      {
-        type: "text",
-        text
-      }
-    ];
-
-    const replyText = await callAi({ chatId, userContentParts });
-    await sendTelegramMessage(token, chatId, replyText);
+    const userContentParts = [{ type: "text", text }];
+    const draftId = Math.max(1, Math.abs((Date.now() >>> 0) % 0x7FFFFFFF));
+    await sendMessageDraft(token, chatId, draftId, "…");
+    const replyText = await callAiStream({
+      chatId,
+      userContentParts,
+      onChunk: (chunk) => sendMessageDraft(token, chatId, draftId, chunk)
+    });
+    await sendMessageDraft(token, chatId, draftId, replyText);
 
     return res.status(200).json({ ok: true });
   }
